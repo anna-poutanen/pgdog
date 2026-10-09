@@ -267,6 +267,69 @@ mod tests {
         assert_eq!(plan.bind_params, [BindParam::UniqueId]);
     }
 
+    #[test]
+    fn test_rewrite_explain_with_existing_params() {
+        let (sql, plan) = run_test(
+            "EXPLAIN (VERBOSE) SELECT $2::text, pgdog.unique_id(), $1::bigint, pgdog.unique_id()",
+            true,
+        );
+
+        assert_eq!(
+            sql,
+            "EXPLAIN (VERBOSE) SELECT $2::text, $3::bigint, $1::bigint, $4::bigint"
+        );
+        assert_eq!(
+            plan.bind_params,
+            [
+                BindParam::FromClientBind(0),
+                BindParam::FromClientBind(1),
+                BindParam::UniqueId,
+                BindParam::UniqueId,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_rewrite_explain_analyze_with_existing_params() {
+        let (sql, plan) = run_test(
+            "EXPLAIN (ANALYZE, VERBOSE) SELECT $1::text, pgdog.unique_id()",
+            true,
+        );
+        assert_eq!(
+            sql,
+            "EXPLAIN (ANALYZE, VERBOSE) SELECT $1::text, $2::bigint"
+        );
+        assert_eq!(
+            plan.bind_params,
+            [BindParam::FromClientBind(0), BindParam::UniqueId]
+        );
+    }
+
+    #[test]
+    fn test_rewrite_explain_without_generated_values() {
+        let (sql, plan) = run_test("EXPLAIN SELECT $2::text, $1::bigint", true);
+        assert_eq!(sql, "EXPLAIN SELECT $2::text, $1::bigint");
+        assert!(plan.stmt.is_none());
+        assert!(plan.bind_params.is_original());
+        assert_eq!(plan.bind_params.num_client_params(), 2);
+    }
+
+    #[test]
+    fn test_rewrite_explain_insert_with_existing_params() {
+        let (sql, plan) = run_test(
+            "EXPLAIN INSERT INTO t (id, name) SELECT pgdog.unique_id(), $1::text",
+            true,
+        );
+        assert_eq!(
+            sql,
+            "EXPLAIN INSERT INTO t (id, name) SELECT $2::bigint, $1::text"
+        );
+        assert_eq!(
+            plan.bind_params,
+            [BindParam::FromClientBind(0), BindParam::UniqueId]
+        );
+    }
+
     fn run_test(sql: &str, extended: bool) -> (String, RewritePlan) {
         let stmt = pg_raw_parse::parse(sql).unwrap();
         let mut ps = PreparedStatements::default();

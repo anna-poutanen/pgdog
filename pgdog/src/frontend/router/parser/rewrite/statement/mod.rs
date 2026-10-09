@@ -123,7 +123,8 @@ impl<'a> StatementRewrite<'a> {
                 self.extended = true;
                 Some(prepare.query())
             }
-            Node::ExecuteStmt(_) | Node::ExplainStmt(_) => None,
+            Node::ExplainStmt(explain) => Some(explain.query()),
+            Node::ExecuteStmt(_) => None,
             // We can't do anything with DDL statements
             _ => return Ok(plan),
         };

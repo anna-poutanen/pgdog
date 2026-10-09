@@ -1,6 +1,63 @@
 use crate::setup::{admin_sqlx, connections_tokio};
+use futures_util::FutureExt;
 use sqlx::Executor;
-use tokio_postgres::SimpleQueryMessage;
+use std::panic::{AssertUnwindSafe, resume_unwind};
+use tokio_postgres::{SimpleQueryMessage, types::Type};
+
+#[tokio::test]
+async fn explain_unique_id_preserves_client_parameters() -> Result<(), Box<dyn std::error::Error>> {
+    let admin = admin_sqlx().await;
+    admin.execute("SET rewrite_enabled TO true").await?;
+    let result = AssertUnwindSafe(async {
+        for client in connections_tokio().await {
+            for options in ["VERBOSE", "ANALYZE, VERBOSE"] {
+                let sql = format!(
+                    "EXPLAIN ({options}) {}",
+                    "SELECT $2::text, pgdog.unique_id(), $1::bigint, pgdog.unique_id()"
+                );
+                let statement = client.prepare(&sql).await?;
+                assert_eq!(statement.params(), &[Type::INT8, Type::TEXT]);
+                for (value, label) in [(42_i64, "first_bind"), (73_i64, "second_bind")] {
+                    let rows = client.query(&statement, &[&value, &label]).await?;
+                    let plan = rows
+                        .iter()
+                        .map(|row| row.get::<_, String>(0))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    assert!(
+                        plan.contains(&format!("'{label}'::text")),
+                        "client text was lost: {plan}"
+                    );
+                    assert!(
+                        plan.contains(&format!("'{value}'::bigint")),
+                        "client bigint was lost: {plan}"
+                    );
+                    assert!(
+                        !plan.contains("pgdog.unique_id()"),
+                        "function was not rewritten: {plan}"
+                    );
+                }
+            }
+        }
+        Ok::<_, Box<dyn std::error::Error>>(())
+    })
+    .catch_unwind()
+    .await;
+    // Await restoration even when an assertion panics, before the runtime exits.
+    let cleanup = admin.execute("RELOAD").await;
+    match result {
+        Ok(result) => {
+            cleanup?;
+            result
+        }
+        Err(panic) => {
+            if let Err(error) = cleanup {
+                eprintln!("failed to restore EXPLAIN test configuration: {error}");
+            }
+            resume_unwind(panic)
+        }
+    }
+}
 
 #[tokio::test]
 async fn explain_routing_annotations_surface() -> Result<(), Box<dyn std::error::Error>> {
