@@ -10,7 +10,8 @@ use crate::util::truncate_utf8;
 static COMMENT_PREFIX: &str = r"(?i)^\s*(?:(?:--[^\n]*\n|/\*[\s\S]*?\*/)\s*)*";
 
 static CMD_BASE: &[&str] = &[
-    "(RE)?SET", "BEGIN", "COMMIT", "ROLLBACK", "LISTEN", "UNLISTEN", "NOTIFY", "DISCARD",
+    "(RE)?SET", "BEGIN", "COMMIT", "END", "ROLLBACK", "ABORT", "LISTEN", "UNLISTEN", "NOTIFY",
+    "DISCARD",
 ];
 
 static CMD_ADVISORY: &[&str] = &[
@@ -140,6 +141,40 @@ mod test {
         assert!(matches("ROLLBACK"));
         assert!(matches("rollback"));
         assert!(matches("   ROLLBACK"));
+    }
+
+    #[test]
+    fn test_transaction_end_synonyms() {
+        for level in [
+            QueryParserLevel::Auto,
+            QueryParserLevel::SessionControl,
+            QueryParserLevel::SessionControlAndLocks,
+        ] {
+            let parser = RegexParser::new(General::regex_parser_limit(), level);
+            for query in [
+                "ABORT",
+                "abort",
+                "   ABORT WORK",
+                "/* comment */ ABORT TRANSACTION",
+                "-- comment\nAbOrT",
+                "END",
+                "end",
+                "   END WORK",
+                "/* comment */ END TRANSACTION",
+                "-- comment\nEnD",
+            ] {
+                for message in [
+                    ProtocolMessage::from(Query::new(query)),
+                    Parse::new_anonymous(query).into(),
+                ] {
+                    let request = ClientRequest::from(vec![message]);
+                    assert!(
+                        parser.use_parser(&request),
+                        "{level:?} must parse transaction control: {query}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
