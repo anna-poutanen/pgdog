@@ -61,6 +61,36 @@ impl Display for Key {
     }
 }
 
+/// Statement parameters follow the source column order, even when several
+/// partition leaves write to the same destination table.
+#[derive(Debug, Hash, PartialEq, Eq)]
+struct StatementKey {
+    destination: Key,
+    // Ordered column names, type OIDs and replica identity flags. Attribute
+    // numbers may contain gaps after DROP COLUMN and do not affect parameters.
+    columns: Vec<(String, Oid, bool)>,
+    full_identity: bool,
+    omni: bool,
+}
+
+impl StatementKey {
+    fn new(table: &Table, omni: bool) -> Self {
+        Self {
+            destination: Key {
+                schema: table.table.destination_schema().to_string(),
+                name: table.table.destination_name().to_string(),
+            },
+            columns: table
+                .columns
+                .iter()
+                .map(|column| (column.name.clone(), column.type_oid, column.identity))
+                .collect(),
+            full_identity: table.is_identity_full(),
+            omni,
+        }
+    }
+}
+
 #[derive(Default, Debug, Clone)]
 struct Statements {
     insert: Statement,
@@ -112,8 +142,8 @@ pub(crate) struct StreamSubscriber {
 
     // Statements
     statements: HashMap<Oid, Statements>,
-    // Mapping of table keys to their oid.
-    keys: HashMap<Key, Oid>,
+    // Reuse prepared statements only for compatible source layouts and routing.
+    statement_keys: HashMap<StatementKey, Oid>,
 
     // Watermark of each table: changes of transactions that begin at or before
     // it are skipped. Starts at the table copy point and is raised to every
@@ -183,7 +213,7 @@ impl StreamSubscriber {
             rows_sharded: 0,
             lsn_changed: true,
             in_transaction: false,
-            keys: HashMap::default(),
+            statement_keys: HashMap::default(),
             missed_rows: MissedRows::default(),
         }
     }
@@ -714,21 +744,20 @@ impl StreamSubscriber {
 
             table.valid()?;
 
-            let dest_key = Key {
-                schema: table.table.destination_schema().to_string(),
-                name: table.table.destination_name().to_string(),
-            };
+            let omni = !table.is_sharded(&self.cluster.sharding_schema().tables);
+            let statement_key = StatementKey::new(&table, omni);
 
-            // Partition child tables target the parent on the destination shard,
-            // we don't need to prepare the same statement per child.
-            if let Some(oid) = self.keys.get(&dest_key) {
+            // Partition leaves can target the same parent with different column
+            // orders or replica identities. Only compatible leaves can share.
+            if let Some(oid) = self.statement_keys.get(&statement_key) {
                 let statements = self.statements.get(oid).ok_or(Error::MissingKey)?;
                 self.statements.insert(relation.oid, statements.clone());
 
-                debug!("queries for table {} already prepared", dest_key);
+                debug!(
+                    "queries for table {} already prepared",
+                    statement_key.destination
+                );
             } else {
-                let omni = !table.is_sharded(&self.cluster.sharding_schema().tables);
-
                 let statements = if table.is_identity_full() {
                     // ── FULL identity path ──────────────────────────────────────────────
                     let insert = Statement::new(&table.insert())?;
@@ -745,7 +774,7 @@ impl StreamSubscriber {
                             "table {} has REPLICA IDENTITY FULL and no primary key; \
                             replication performance will be degraded without an index \
                             on the destination table.",
-                            dest_key
+                            statement_key.destination
                         );
                         // Upsert slot is unused for sharded tables (omni == false).
                         Statement::default()
@@ -797,7 +826,7 @@ impl StreamSubscriber {
                 };
 
                 self.statements.insert(relation.oid, statements);
-                self.keys.insert(dest_key, relation.oid);
+                self.statement_keys.insert(statement_key, relation.oid);
             }
 
             // Only record tables we expect to stream changes for.
@@ -824,7 +853,7 @@ impl StreamSubscriber {
         self.sent_lsn = self.committed_lsn;
         self.relations.clear();
         self.statements.clear();
-        self.keys.clear();
+        self.statement_keys.clear();
         self.in_transaction = false;
         self.connect().await
     }
@@ -849,7 +878,7 @@ impl StreamSubscriber {
                 // Per-session state — repopulated from Relation messages on reconnect.
                 self.relations.clear();
                 self.statements.clear();
-                self.keys.clear();
+                self.statement_keys.clear();
                 self.in_transaction = false;
                 Err(err)
             }
@@ -1033,13 +1062,44 @@ impl StreamSubscriber {
 
 #[cfg(test)]
 mod tests {
-    use super::super::tests::{begin_copy_data, commit_copy_data, test_origins};
+    use super::super::tests::{
+        begin_copy_data, commit_copy_data, make_sharded_table, sharded_relation, test_origins,
+    };
     use super::*;
     use crate::config::config;
 
     async fn make_subscriber() -> StreamSubscriber {
         let cluster = Cluster::new_test(&config());
         StreamSubscriber::new(&cluster, vec![], test_origins(&cluster).await)
+    }
+
+    #[tokio::test]
+    async fn compatible_partition_layouts_reuse_statements() -> Result<(), Error> {
+        let mut leaf_a = make_sharded_table();
+        leaf_a.table.parent_schema = "public".to_string();
+        leaf_a.table.parent_name = "sharded".to_string();
+        leaf_a.table.name = "sharded_p1".to_string();
+        let mut leaf_b = leaf_a.clone();
+        leaf_b.table.name = "sharded_p2".to_string();
+        // A dropped column changes attribute numbers, but not tuple positions.
+        leaf_b.columns[1].oid += 2;
+
+        let cluster = Cluster::new_test_single_shard(&config());
+        let mut sub = StreamSubscriber::new(&cluster, vec![leaf_a, leaf_b], vec![]);
+        for (oid, name) in [(Oid(1), "sharded_p1"), (Oid(2), "sharded_p2")] {
+            let mut relation = sharded_relation(oid);
+            relation.name = name.to_string();
+            sub.relation(relation).await?;
+        }
+
+        assert_eq!(sub.statement_keys.len(), 1);
+        let first = sub.statements.get(&Oid(1)).ok_or(Error::MissingKey)?;
+        let second = sub.statements.get(&Oid(2)).ok_or(Error::MissingKey)?;
+        assert_eq!(first.insert.parse().name(), second.insert.parse().name());
+        assert_eq!(first.upsert.parse().name(), second.upsert.parse().name());
+        assert_eq!(first.update.parse().name(), second.update.parse().name());
+        assert_eq!(first.delete.parse().name(), second.delete.parse().name());
+        Ok(())
     }
 
     #[tokio::test]

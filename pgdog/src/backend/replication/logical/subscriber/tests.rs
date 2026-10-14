@@ -15,7 +15,7 @@ use crate::{
     },
     config::config,
     net::{
-        CopyData, ToBytes,
+        CopyData, Format, ToBytes,
         replication::{
             XLogData,
             logical::{
@@ -151,7 +151,7 @@ fn xlog_copy_data(payload: Bytes) -> CopyData {
     CopyData::new(&xlog.to_bytes())
 }
 
-fn make_sharded_table() -> Table {
+pub(super) fn make_sharded_table() -> Table {
     Table {
         publication: "test".to_string(),
         table: PublicationTable {
@@ -217,7 +217,7 @@ fn make_sharded_test_b_table() -> Table {
     }
 }
 
-fn sharded_relation(oid: Oid) -> Relation {
+pub(super) fn sharded_relation(oid: Oid) -> Relation {
     Relation {
         oid,
         namespace: "public".to_string(),
@@ -753,6 +753,214 @@ async fn partition_leaves_share_destination() {
     assert_eq!(count_row(&mut verify, "public.sharded", &id_b).await, 1);
 
     cleanup(&mut verify, "public.sharded", &[&id_a, &id_b]).await;
+}
+
+fn partition_layout_leaf(destination: &str, oid: Oid, reversed: bool, value_type: Oid) -> Table {
+    let mut table = make_sharded_table();
+    table.table.name = format!("{destination}_{}", if reversed { "b" } else { "a" });
+    table.table.parent_schema = "public".to_string();
+    table.table.parent_name = destination.to_string();
+    table.identity = ReplicaIdentity {
+        oid,
+        identity: "d".to_string(),
+        kind: "r".to_string(),
+    };
+    table.columns[1].type_oid = value_type;
+    if reversed {
+        table.columns.reverse();
+    }
+    for (index, column) in table.columns.iter_mut().enumerate() {
+        column.oid = index as i32 + 1;
+    }
+    table
+}
+
+fn partition_layout_relation(table: &Table) -> CopyData {
+    xlog_copy_data(
+        Relation {
+            oid: table.identity.oid,
+            namespace: table.table.schema.clone(),
+            name: table.table.name.clone(),
+            replica_identity: b'd' as i8,
+            columns: table
+                .columns
+                .iter()
+                .map(|column| RelColumn {
+                    flag: if column.identity { 1 } else { 0 },
+                    name: column.name.clone(),
+                    oid: column.type_oid,
+                    type_modifier: -1,
+                })
+                .collect(),
+        }
+        .to_bytes(),
+    )
+}
+
+fn binary_bigint_column(value: i64) -> TupleColumn {
+    TupleColumn {
+        identifier: Identifier::Format(Format::Binary),
+        len: 8,
+        data: Bytes::copy_from_slice(&value.to_be_bytes()),
+    }
+}
+
+fn partition_layout_tuple(table: &Table, id: i64, value: &TupleColumn) -> TupleData {
+    TupleData {
+        columns: table
+            .columns
+            .iter()
+            .map(|column| {
+                if column.identity {
+                    binary_bigint_column(id)
+                } else {
+                    value.clone()
+                }
+            })
+            .collect(),
+    }
+}
+
+/// Exercise two source layouts against one real destination, including the
+/// cached INSERT/UPSERT, UPDATE and DELETE statements. Relation arrival order
+/// must not decide how the other leaf's tuple positions are interpreted.
+async fn partition_layout_round_trip(
+    value_type: Oid,
+    value_sql: &str,
+    initial_values: [TupleColumn; 2],
+    changed_values: [TupleColumn; 2],
+    expected_values: [&str; 4],
+) -> Result<(), Box<dyn std::error::Error>> {
+    for reversed_first in [false, true] {
+        let destination = format!("partition_layout_{}", random_id());
+        let leaves = [
+            partition_layout_leaf(&destination, Oid(16384), false, value_type),
+            partition_layout_leaf(&destination, Oid(16385), true, value_type),
+        ];
+        let cluster = Cluster::new_test_single_shard(&config());
+        let origin = ReplicationOrigin::builder()
+            .name(&destination)
+            .address(primary(cluster.shards().first().ok_or(Error::MissingData)?)?.addr())
+            .shard(0)
+            .build();
+        origin.create_origin().await?;
+        let mut sub = StreamSubscriber::new(&cluster, leaves.to_vec(), vec![origin.clone()]);
+        let mut verify = test_server().await;
+        verify
+            .execute_checked(format!(
+                "CREATE TABLE public.{destination} (id BIGINT PRIMARY KEY, value {value_sql})"
+            ))
+            .await?;
+
+        let result = async {
+            sub.connect().await?;
+            sub.handle(begin_copy_data(100)).await?;
+            let order = if reversed_first { [1, 0] } else { [0, 1] };
+            for index in order {
+                sub.handle(partition_layout_relation(&leaves[index])).await?;
+            }
+
+            let mut snapshots = Vec::new();
+            for phase in 0..3 {
+                let begin_lsn = 100 + phase * 200;
+                let commit_lsn = begin_lsn + 100;
+                if phase != 0 {
+                    sub.handle(begin_copy_data(begin_lsn)).await?;
+                }
+                for (index, table) in leaves.iter().enumerate() {
+                    let id = [11, 22][index];
+                    let message = match phase {
+                        0 => xlog_copy_data(
+                            XLogInsert {
+                                oid: table.identity.oid,
+                                tuple_data: partition_layout_tuple(table, id, &initial_values[index]),
+                            }
+                            .to_bytes(),
+                        ),
+                        1 => x_update(XLogUpdate {
+                            oid: table.identity.oid,
+                            identity: UpdateIdentity::Nothing,
+                            new: partition_layout_tuple(table, id, &changed_values[index]),
+                        }),
+                        _ => xlog_copy_data(
+                            XLogDelete {
+                                oid: table.identity.oid,
+                                // pgoutput's key tuple retains the source column positions,
+                                // using null placeholders for non-identity columns.
+                                key: Some(partition_layout_tuple(table, id, &null_column())),
+                                old: None,
+                            }
+                            .to_bytes(),
+                        ),
+                    };
+                    sub.handle(message).await?;
+                }
+                sub.handle(commit_copy_data(commit_lsn)).await?;
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while sub.status_update().last_flushed < commit_lsn {
+                    sub.check_confirmed_sent_lsn().await?;
+                    if Instant::now() >= deadline {
+                        return Err(format!("transaction {commit_lsn} never completed").into());
+                    }
+                    sleep(Duration::from_millis(10)).await;
+                }
+                let rows: Vec<String> = verify
+                    .fetch_all(format!(
+                        "SELECT id::text || ':' || value::text FROM public.{destination} ORDER BY id"
+                    ))
+                    .await?;
+                snapshots.push(rows);
+            }
+            Ok::<_, Box<dyn std::error::Error>>(snapshots)
+        }
+        .await;
+
+        drop(sub);
+        verify
+            .execute_checked(format!("DROP TABLE public.{destination}"))
+            .await?;
+        origin.drop_origin().await?;
+        assert_eq!(
+            result?,
+            [
+                vec![
+                    format!("11:{}", expected_values[0]),
+                    format!("22:{}", expected_values[1])
+                ],
+                vec![
+                    format!("11:{}", expected_values[2]),
+                    format!("22:{}", expected_values[3])
+                ],
+                Vec::new(),
+            ],
+            "reversed partition Relation arrived first: {reversed_first}"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn partition_layout_reordered_bigints() -> Result<(), Box<dyn std::error::Error>> {
+    partition_layout_round_trip(
+        Oid(20),
+        "BIGINT",
+        [binary_bigint_column(101), binary_bigint_column(202)],
+        [binary_bigint_column(301), binary_bigint_column(402)],
+        ["101", "202", "301", "402"],
+    )
+    .await
+}
+
+#[tokio::test]
+async fn partition_layout_reordered_text() -> Result<(), Box<dyn std::error::Error>> {
+    partition_layout_round_trip(
+        Oid(25),
+        "TEXT",
+        [text_column("leaf_a"), text_column("leaf_b")],
+        [text_column("updated_a"), text_column("updated_b")],
+        ["leaf_a", "leaf_b", "updated_a", "updated_b"],
+    )
+    .await
 }
 
 // ── Data flow tests ─────────────────────────────────────────────────
